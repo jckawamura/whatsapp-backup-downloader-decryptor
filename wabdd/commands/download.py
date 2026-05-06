@@ -147,12 +147,16 @@ class DownloaderWorker(Thread):
                         self.progress.console.print(f"Skipping {real_path} (excluded)")
                         continue
 
-                # Check if file is already downloaded
+                # Check if file is already downloaded or partially downloaded
                 local_file = self.output / stripped_filepath
+                offset = 0
                 if local_file.exists():
                     if get_md5_hash_from_file(local_file) == file_hash:
                         # self.progress.console.print(f"Skipping {file_name}")
                         continue
+                    local_size = local_file.stat().st_size
+                    if local_size < file_size:
+                        offset = local_size
 
                 # Create task
                 self.task_id = self.progress.add_task(
@@ -160,10 +164,11 @@ class DownloaderWorker(Thread):
                     start=False,
                     filename=crop_string(file_name, 20),
                     total=file_size,
+                    completed=offset,
                 )
 
                 # Download the file
-                with self.client.download(file_path) as r:
+                with self.client.download(file_path, offset=offset) as r:
                     if r.status_code == 401:
                         self.progress.console.print(
                             "Token expired, stopping download",
@@ -183,8 +188,21 @@ class DownloaderWorker(Thread):
                         )
                         continue
 
+                    if r.status_code == 429:
+                        self.progress.console.print(
+                            f"Rate limit exceeded after all retries for {file_name}, skipping",
+                        )
+                        continue
+
+                    # If we requested a range but the server returned 200 (ignored Range),
+                    # fall back to a full download to avoid appending duplicate data.
+                    if offset > 0 and r.status_code == 200:
+                        offset = 0
+                        self.progress.update(self.task_id, completed=0)
+
                     r.raise_for_status()
-                    with open(local_file, "wb") as f:
+                    open_mode = "ab" if offset > 0 else "wb"
+                    with open(local_file, open_mode) as f:
                         self.progress.start_task(self.task_id)
                         for chunk in r.iter_content(chunk_size=8192):
                             if _stop_event.is_set():  # Exit early if stop event is set
@@ -192,6 +210,11 @@ class DownloaderWorker(Thread):
 
                             self.progress.update(self.task_id, advance=len(chunk))
                             f.write(chunk)
+
+                if get_md5_hash_from_file(local_file) != file_hash:
+                    self.progress.console.print(
+                        f"Warning: MD5 mismatch for {file_name}, file may be corrupted",
+                    )
 
                 # Write metadata if available
                 if metadata:

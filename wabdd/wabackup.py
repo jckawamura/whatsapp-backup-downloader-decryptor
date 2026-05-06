@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import time
 from urllib.parse import quote
 
 import requests
 
 from . import gpsoauth_helper, utils
 from .constants import USER_AGENT
+
+_MAX_RETRIES = 5
 
 
 class WaBackup:
@@ -30,17 +33,24 @@ class WaBackup:
         if not (auth_token or master_token):
             raise ValueError("At least one token must be provided")
 
-    def _get(self, path, params=None, **kwargs):
+    def _get(self, path, params=None, extra_headers=None, **kwargs):
         path = quote(path)
-        r = requests.get(
-            f"https://backup.googleapis.com/v1/{path}",
-            headers={
+
+        def _do_request():
+            headers = {
                 "Authorization": f"Bearer {self.auth_token}",
                 "User-Agent": USER_AGENT,
-            },
-            params=params,
-            **kwargs,
-        )
+            }
+            if extra_headers:
+                headers.update(extra_headers)
+            return requests.get(
+                f"https://backup.googleapis.com/v1/{path}",
+                headers=headers,
+                params=params,
+                **kwargs,
+            )
+
+        r = _do_request()
 
         # If the request is unauthorized, try to refresh the auth token
         if r.status_code == 401:
@@ -55,15 +65,16 @@ class WaBackup:
             except gpsoauth_helper.AuthException:
                 raise ValueError("Something went wrong while refreshing the auth token")
 
-            r = requests.get(
-                f"https://backup.googleapis.com/v1/{path}",
-                headers={
-                    "Authorization": f"Bearer {self.auth_token}",
-                    "User-Agent": USER_AGENT,
-                },
-                params=params,
-                **kwargs,
-            )
+            r = _do_request()
+
+        # Handle rate limiting with exponential backoff
+        for attempt in range(_MAX_RETRIES):
+            if r.status_code != 429:
+                break
+            r.close()
+            delay = int(r.headers.get("Retry-After", min(2**attempt, 60)))
+            time.sleep(delay)
+            r = _do_request()
 
         return r
 
@@ -73,10 +84,12 @@ class WaBackup:
             None if page_token is None else {"pageToken": page_token},
         ).json()
 
-    def download(self, path):
+    def download(self, path, offset=0):
+        extra_headers = {"Range": f"bytes={offset}-"} if offset > 0 else None
         return self._get(
             path,
             params={"alt": "media"},
+            extra_headers=extra_headers,
             stream=True,
         )
 
